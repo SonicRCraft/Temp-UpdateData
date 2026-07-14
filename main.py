@@ -1,9 +1,12 @@
 import pandas as pd
 from openpyxl.styles import Font
-from sqlalchemy import create_engine # Import baru untuk koneksi database
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
 
-file_path = r'D:\Code\ICT\Pipeline\Docs\Wiki Sementara Tahun 2026.xlsx'
-output_path = r'D:\Code\ICT\Pipeline\AddData\Data Baru.xlsx' 
+load_dotenv()
+
+file_path = os.getenv("EXCEL_SOURCE_PATH")
+output_path = os.getenv("EXCEL_OUTPUT_PATH")
 
 # 1. Membaca & Membersihkan Data
 df_karyawan = pd.read_excel(file_path, sheet_name='List Initial', usecols="A:C", header=1)
@@ -19,11 +22,11 @@ df_proptek = df_proptek.dropna(how='all')
 # =======================================================
 
 # Konfigurasi Database (Ganti dengan kredensial PostgreSQL kamu)
-DB_USER = 'username_postgres'
-DB_PASS = 'password_postgres'
-DB_HOST = 'localhost' # Gunakan IP server jika database tidak di komputer lokal
-DB_PORT = '5432'      # Port default PostgreSQL
-DB_NAME = 'nama_database_kamu'
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
 
 # Membuat jembatan koneksi (engine)
 engine = create_engine(f'postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}')

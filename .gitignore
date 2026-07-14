@@ -1,0 +1,6 @@
+# Mengabaikan file Environment Variables (Berisi kredensial rahasia)
+.env
+
+# Mengabaikan semua file Excel (Agar data spreadsheet tidak masuk ke repositori git)
+*.xlsx
+*.xls
