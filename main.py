@@ -1,5 +1,6 @@
 import os
 import re
+import urllib.parse  # 1. Tambahkan import urllib.parse
 import pandas as pd
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -42,7 +43,11 @@ df_proptek = df_proptek.dropna(how='all')
 # =======================================================
 # 3. KONEKSI & PROSES DATABASE (CEK & INSERT)
 # =======================================================
-engine = create_engine(f'postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}')
+# 2. Parse password menggunakan quote_plus agar karakter spesial aman
+encoded_password = urllib.parse.quote_plus(DB_PASS)
+
+# 3. Gunakan encoded_password di connection string
+engine = create_engine(f'postgresql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}')
 print("Terkoneksi ke PostgreSQL. Memulai proses sinkronisasi (Cek duplikasi)...")
 
 prop_counter = 1
