@@ -5,246 +5,202 @@ from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
 # =======================================================
-# 1. PERSIAPAN & LOAD EXCEL
+# 1. KONFIGURASI DATABASE & EXCEL
 # =======================================================
 load_dotenv()
-file_path = os.getenv("EXCEL_SOURCE_PATH", "Test Add Database.xlsx")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "password")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "DB_Pipeline")
 
-if not os.path.exists(file_path):
-    raise ValueError(f"Path file Excel '{file_path}' tidak ditemukan.")
+# Sesuaikan dengan nama file Excel Anda
+FILE_INPUT = os.getenv("EXCEL_SOURCE_PATH", "Data Baru.xlsx")
 
-print(f"Membaca file: {file_path}...")
+if not os.path.exists(FILE_INPUT):
+    raise ValueError(f"File '{FILE_INPUT}' tidak ditemukan!")
 
+# =======================================================
+# 2. LOAD & MAPPING DATA EXCEL
+# =======================================================
+print(f"Membaca file: {FILE_INPUT}...")
 try:
-    df_customer = pd.read_excel(file_path, sheet_name='Inisial Customer')
+    df_customer_raw = pd.read_excel(FILE_INPUT, sheet_name='Inisial Customer')
+    df_proptek = pd.read_excel(FILE_INPUT, sheet_name='Proptek Modified')
 except ValueError:
-    df_customer = pd.read_excel(file_path, sheet_name='List Initial', usecols="E:G", header=1)
+    df_proptek = pd.read_excel(FILE_INPUT, sheet_name='Proptek')
 
-try:
-    df_proptek = pd.read_excel(file_path, sheet_name='Proptek Modified')
-except ValueError:
-    df_proptek = pd.read_excel(file_path, sheet_name='Proptek')
+cust_initial_col = [c for c in df_customer_raw.columns if 'Inisial' in c][0]
+cust_name_col = [c for c in df_customer_raw.columns if 'Nama' in c][0]
+customer_map = dict(zip(
+    df_customer_raw[cust_initial_col].dropna().astype(str).str.strip().str.upper(),
+    df_customer_raw[cust_name_col].dropna().astype(str).str.strip()
+))
 
-df_customer = df_customer.dropna(how='all')
 df_proptek = df_proptek.dropna(how='all')
 
 # =======================================================
-# 2. MAPPING INISIAL CUSTOMER
+# 3. KONEKSI & PROSES DATABASE (CEK & INSERT)
 # =======================================================
-kolom_target = next((col for col in df_customer.columns if 'Inisial' in str(col)), None)
-nama_col = next((col for col in df_customer.columns if 'Nama' in str(col)), df_customer.columns[1] if len(df_customer.columns) > 1 else None)
-
-if kolom_target and nama_col:
-    customer_map = dict(zip(
-        df_customer[kolom_target].dropna().astype(str).str.strip().str.upper(), 
-        df_customer[nama_col].dropna().astype(str).str.strip()
-    ))
-else:
-    customer_map = {}
-
-if 'Customer Initial' in df_proptek.columns:
-    df_proptek['Customer Initial'] = df_proptek['Customer Initial'].astype(str).str.strip().str.upper().map(customer_map).fillna(df_proptek['Customer Initial'])
-
-# =======================================================
-# 3. KONEKSI DATABASE POSTGRESQL
-# =======================================================
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME")
-
 engine = create_engine(f'postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}')
-print("Terkoneksi ke PostgreSQL. Memulai proses transfer...")
+print("Terkoneksi ke PostgreSQL. Memulai proses sinkronisasi (Cek duplikasi)...")
 
-# =======================================================
-# 4. HELPER & PROSES SINKRONISASI DATA MASTER
-# =======================================================
-def get_unique_list(series):
-    items = {}
-    for val in series.dropna().astype(str):
-        for p in re.split(r',|&', val):
-            clean = p.strip()
-            if clean and clean.lower() not in ['nan', 'none', 'null', '-', '']:
-                items[clean.lower()] = clean # Simpan dengan format aslinya
-    return list(items.values())
+prop_counter = 1
 
+# Menggunakan block transaksi agar aman
 with engine.begin() as conn:
-    print("Memeriksa & Sync Data Master (Customer, SA, Principal)...")
-    
-    # Sync Customer
-    for name in get_unique_list(df_proptek.get('Customer Initial', pd.Series([]))):
-        conn.execute(
-            text("INSERT INTO customers (customer_name, sector) SELECT :name, '-' WHERE NOT EXISTS (SELECT 1 FROM customers WHERE LOWER(customer_name) = LOWER(:name))"), 
-            {"name": name}
-        )
-    
-    # Sync Solution Architect (CEK DAN UPDATE JIKA EMAIL NULL)
-    for name in get_unique_list(df_proptek.get('Solution Architect', pd.Series([]))):
-        email = f"{re.sub(r'[^a-z0-9]', '', str(name).lower())}@dummy.com"
+    for idx, row in df_proptek.iterrows():
+        # ---------------------------------------------------
+        # A. MASTER CUSTOMER
+        # ---------------------------------------------------
+        init = str(row.get('Customer Initial', '')).strip().upper()
+        if not init or init.lower() in ['nan', 'none', 'null', '']:
+            continue  # Lewati jika tidak ada inisial customer di baris ini
+
+        cust_name = customer_map.get(init, init)
         
-        # Cek apakah SA sudah ada di database
-        existing_sa = conn.execute(
-            text("SELECT id, email FROM solution_architects WHERE LOWER(name) = LOWER(:name) LIMIT 1"),
-            {"name": name}
-        ).fetchone()
-
-        if existing_sa:
-            # Jika sudah ada, tapi email-nya null atau kosong, maka UPDATE emailnya
-            if existing_sa[1] is None or str(existing_sa[1]).strip() == "":
-                conn.execute(
-                    text("UPDATE solution_architects SET email = :email WHERE id = :id"),
-                    {"email": email, "id": existing_sa[0]}
-                )
+        # Cek apakah Customer sudah ada
+        res_cust = conn.execute(
+            text("SELECT id FROM customers WHERE LOWER(customer_name) = LOWER(:name)"), 
+            {"name": cust_name}
+        ).scalar()
+        
+        if res_cust:
+            cust_id = res_cust  # Gunakan ID yang sudah ada (Tidak perlu Insert)
         else:
-            # Jika belum ada, langsung INSERT beserta emailnya
-            conn.execute(
-                text("INSERT INTO solution_architects (name, email) VALUES (:name, :email)"),
-                {"name": name, "email": email}
-            )
-    
-    # Sync Principal
-    for name in get_unique_list(df_proptek.get('Principal', pd.Series([]))):
-        conn.execute(
-            text("INSERT INTO principals (principal_name) SELECT :name WHERE NOT EXISTS (SELECT 1 FROM principals WHERE LOWER(principal_name) = LOWER(:name))"), 
-            {"name": name}
-        )
+            # Insert tanpa kolom ID agar DB generate UUID otomatis, lalu tangkap ID-nya
+            cust_id = conn.execute(
+                text("INSERT INTO customers (customer_name, sector) VALUES (:name, '-') RETURNING id"),
+                {"name": cust_name}
+            ).scalar()
 
-# =======================================================
-# 5. TRANSAKSI (UPSERT LOGIC DENGAN RETURNING ID)
-# =======================================================
-def get_str(val):
-    v = str(val).strip()
-    return "-" if not v or v.lower() in ['nan', 'none', 'null', ''] else v
-
-# PERBAIKAN: Menghilangkan .0 jika angka berupa bilangan bulat (integer)
-def get_num(val):
-    v = str(val).strip()
-    if not v or v.lower() in ['nan', 'none', 'null', '-', '']: 
-        return 0
-    try: 
-        f = float(v)
-        return int(f) if f.is_integer() else f
-    except ValueError: 
-        return 0
-
-print("Memproses data Pipeline & Proposal...")
-
-with engine.connect() as conn:
-    # Mengambil ID Master Data dengan format lower() agar kebal terhadap Case-Sensitivity
-    cust_map = {row[1].lower(): row[0] for row in conn.execute(text("SELECT id, customer_name FROM customers")).fetchall()}
-    sa_map = {row[1].lower(): row[0] for row in conn.execute(text("SELECT id, name FROM solution_architects")).fetchall()}
-    prin_map = {row[1].lower(): row[0] for row in conn.execute(text("SELECT id, principal_name FROM principals")).fetchall()}
-
-    proposal_counter = 1
-
-    for index, row in df_proptek.iterrows():
-        try:
-            cust_val = str(row.get('Customer Initial', '')).strip().lower()
-            sa_val = str(row.get('Solution Architect', '')).strip().lower()
+        # ---------------------------------------------------
+        # B. MASTER SOLUTION ARCHITECT
+        # ---------------------------------------------------
+        sa_name = str(row.get('Solution Architect', '')).strip()
+        sa_id = None
+        if sa_name and sa_name.lower() not in ['nan', 'none', 'null', '']:
+            res_sa = conn.execute(
+                text("SELECT id FROM solution_architects WHERE LOWER(name) = LOWER(:name)"),
+                {"name": sa_name}
+            ).scalar()
             
-            customer_id = cust_map.get(cust_val)
-            sa_id = sa_map.get(sa_val)
-
-            if not customer_id:
-                # Lewati jika baris ini tidak memiliki Customer yang valid
-                continue
-
-            # Ambil semua data dari Excel
-            judul_proposal = get_str(row.get('Judul Proposal', row.get('Title', '')))
-            solution_type = get_str(row.get('Solution', '-'))
-            project_revenue = get_num(row.get('Project Revenue', row.get('project_revenue')))
-            next_action_plan = get_str(row.get('Next Action Plan', row.get('next_action_plan')))
-            est_time_line = get_str(row.get('Est Timeline', row.get('est_time_line')))
-            current_status = get_str(row.get('Statu', row.get('Status', row.get('Current Status', '-'))))
-            last_update = get_str(row.get('Last Update', row.get('last_update', '-')))
-            sales_stage = get_str(row.get('Sales Stage', row.get('sales_stage', '-')))
-            sales_type = get_str(row.get('Sales Type', row.get('sales_type', '-')))
-            
-            # Format nama project unik dengan solution type (Opsional)
-            project_name = f"{judul_proposal} ({solution_type})" if solution_type != "-" else judul_proposal
-
-            with conn.begin(): # Transaksi per baris agar aman
-                # 1. Cek Pipeline (Apakah sudah ada?)
-                existing_pipeline = conn.execute(
-                    text("SELECT id FROM pipelines WHERE project_name = :p AND customer_id = :c LIMIT 1"),
-                    {"p": project_name, "c": customer_id}
+            if res_sa:
+                sa_id = res_sa
+            else:
+                email = f"{re.sub(r'[^a-z0-9]', '', sa_name.lower())}@dummy.com"
+                sa_id = conn.execute(
+                    text("INSERT INTO solution_architects (name, email) VALUES (:name, :email) RETURNING id"),
+                    {"name": sa_name, "email": email}
                 ).scalar()
 
-                if existing_pipeline:
-                    # --- UPDATE PIPELINE EXISTING ---
-                    pipeline_id = str(existing_pipeline)
-                    conn.execute(
-                        text("""
-                            UPDATE pipelines 
-                            SET solution_type = :st, solution_architect_id = :sa, project_revenue = :rev,
-                                next_action_plan = :nap, est_time_line = :etl, current_status = :cs,
-                                last_update = :lu, sales_stage = :ss, sales_type = :stype, updated_at = now()
-                            WHERE id = :id
-                        """),
-                        {
-                            "id": pipeline_id, "st": solution_type, "sa": sa_id, "rev": project_revenue,
-                            "nap": next_action_plan, "etl": est_time_line, "cs": current_status,
-                            "lu": last_update, "ss": sales_stage, "stype": sales_type
-                        }
-                    )
+        # ---------------------------------------------------
+        # C. MASTER PRINCIPAL
+        # ---------------------------------------------------
+        raw_p = str(row.get('Principal', '')).strip()
+        principal_ids = []
+        if raw_p and raw_p.lower() not in ['nan', 'none', 'null', '']:
+            # Handle jika ada lebih dari 1 principal dalam 1 sel (dipisah koma/dan)
+            for p in re.split(r',|&', raw_p):
+                p = p.strip()
+                if p and p.lower() not in ['nan', 'none', 'null', '']:
+                    res_p = conn.execute(
+                        text("SELECT id FROM principals WHERE LOWER(principal_name) = LOWER(:name)"),
+                        {"name": p}
+                    ).scalar()
                     
-                    conn.execute(text("UPDATE proposals SET title = :t, updated_at = now() WHERE pipeline_id = :pid"), {"t": judul_proposal, "pid": pipeline_id})
-                    conn.execute(text("DELETE FROM principal_pipelines WHERE pipeline_id = :pid"), {"pid": pipeline_id})
-                
-                else:
-                    # --- INSERT PIPELINE BARU (Generate ID by DB) ---
-                    res = conn.execute(
-                        text("""
-                            INSERT INTO pipelines (
-                                project_name, solution_type, customer_id, solution_architect_id, 
-                                project_revenue, next_action_plan, est_time_line, current_status, 
-                                last_update, sales_stage, sales_type
-                            ) VALUES (
-                                :p, :st, :c, :sa, :rev, :nap, :etl, :cs, :lu, :ss, :stype
-                            ) RETURNING id
-                        """),
-                        {
-                            "p": project_name, "st": solution_type, "c": customer_id, "sa": sa_id, "rev": project_revenue,
-                            "nap": next_action_plan, "etl": est_time_line, "cs": current_status,
-                            "lu": last_update, "ss": sales_stage, "stype": sales_type
-                        }
-                    )
-                    pipeline_id = res.scalar()
+                    if res_p:
+                        principal_ids.append(res_p)
+                    else:
+                        new_p_id = conn.execute(
+                            text("INSERT INTO principals (principal_name) VALUES (:name) RETURNING id"),
+                            {"name": p}
+                        ).scalar()
+                        principal_ids.append(new_p_id)
 
-                    # Penomoran Proposal
-                    no_prop = str(row.get('Nomor Proposal', '')).strip()
-                    if no_prop.lower() in ['nan', 'none', 'null', '', '-']:
-                        no_prop = f"PROP-{proposal_counter:04d}"
-                        proposal_counter += 1
+        # ---------------------------------------------------
+        # D. TRANSAKSI PIPELINE
+        # ---------------------------------------------------
+        judul = str(row.get('Judul Proposal', row.get('Title', '-'))).strip()
+        sol = str(row.get('Solution', '-')).strip()
+        status = str(row.get('Statu', row.get('Status', '-'))).strip()
+        
+        project_name = f"{judul} ({sol})" if sol not in ["-", "nan", ""] else judul
+        
+        # Cek Pipeline (berdasarkan nama project dan customer_id)
+        res_pipe = conn.execute(
+            text("SELECT id FROM pipelines WHERE project_name = :p AND customer_id = :c"),
+            {"p": project_name, "c": cust_id}
+        ).scalar()
 
-                    # INSERT PROPOSAL TEMP
-                    conn.execute(
-                        text("INSERT INTO proposal_temps (no_proposal, status, pipeline_id) VALUES (:np, 'pending', :pid)"),
-                        {"np": no_prop, "pid": pipeline_id}
-                    )
+        if res_pipe:
+            # Jika pipeline sudah ada, ambil ID-nya dan JANGAN INSERT
+            pipe_id = res_pipe
+        else:
+            # Jika belum ada, masukkan data baru. Project revenue diset mutlak 0
+            pipe_id = conn.execute(
+                text("""
+                    INSERT INTO pipelines (
+                        project_name, solution_type, project_revenue, next_action_plan, 
+                        est_time_line, current_status, last_update, sales_stage, sales_type, 
+                        customer_id, solution_architect_id
+                    ) VALUES (
+                        :p, :st, :rev, '-', '-', :cs, '-', '-', '-', :cid, :said
+                    ) RETURNING id
+                """),
+                {
+                    "p": project_name, "st": sol, "rev": 0, "cs": status, 
+                    "cid": cust_id, "said": sa_id
+                }
+            ).scalar()
 
-                    # INSERT PROPOSAL
-                    conn.execute(
-                        text("""
-                            INSERT INTO proposals (title, no_proposal, is_deleted, pipeline_id) 
-                            VALUES (:t, :np, false, :pid)
-                        """),
-                        {"t": judul_proposal, "np": no_prop, "pid": pipeline_id}
-                    )
+            # ---------------------------------------------------
+            # E. PROPOSAL & PROPOSAL TEMP 
+            # ---------------------------------------------------
+            no_prop = str(row.get('Nomor Proposal', '')).strip()
+            if no_prop.lower() in ['nan', 'none', 'null', '', '-']:
+                no_prop = f"PROP-{prop_counter:04d}"
+                prop_counter += 1
 
-                # --- INSERT RELASI MANY-TO-MANY (Principal Pipeline) ---
-                principal_raw = str(row.get('Principal', '')).strip()
-                if principal_raw and principal_raw.lower() not in ['nan', 'none', 'null', '', '-']:
-                    for p_name in [p.strip() for p in re.split(r',|&', principal_raw) if p.strip()]:
-                        p_id = prin_map.get(p_name.lower())
-                        if p_id:
-                            conn.execute(
-                                text("INSERT INTO principal_pipelines (project_name, principal_id, pipeline_id) VALUES (:pn, :pid, :pipe_id)"),
-                                {"pn": project_name, "pid": p_id, "pipe_id": pipeline_id}
-                            )
+            # Cek Proposal Temp
+            res_temp = conn.execute(
+                text("SELECT id FROM proposal_temps WHERE pipeline_id = :pid AND no_proposal = :np"),
+                {"pid": pipe_id, "np": no_prop}
+            ).scalar()
+            if not res_temp:
+                conn.execute(
+                    text("INSERT INTO proposal_temps (no_proposal, status, pipeline_id) VALUES (:np, 'pending', :pid)"),
+                    {"np": no_prop, "pid": pipe_id}
+                )
 
-        except Exception as row_err:
-            print(f"Gagal memproses baris Excel ke-{index + 2}: {row_err}")
+            # Cek Proposal (MENGISI file, rfa, rfi DENGAN STRING KOSONG '')
+            res_prop = conn.execute(
+                text("SELECT id FROM proposals WHERE pipeline_id = :pid AND no_proposal = :np"),
+                {"pid": pipe_id, "np": no_prop}
+            ).scalar()
+            if not res_prop:
+                conn.execute(
+                    text("""
+                        INSERT INTO proposals (title, no_proposal, is_deleted, pipeline_id, file, rfa, rfi) 
+                        VALUES (:t, :np, false, :pid, '', '', '')
+                    """),
+                    {"t": judul, "np": no_prop, "pid": pipe_id}
+                )
 
-print("Berhasil! Seluruh data terhubung dan disinkronkan ke PostgreSQL.")
+        # ---------------------------------------------------
+        # F. PRINCIPAL PIPELINES (Junction Table)
+        # ---------------------------------------------------
+        # Relasikan pipeline dengan principal (bisa >1 principal per baris)
+        for pid in principal_ids:
+            res_pp = conn.execute(
+                text("SELECT id FROM principal_pipelines WHERE pipeline_id = :pipe_id AND principal_id = :prin_id"),
+                {"pipe_id": pipe_id, "prin_id": pid}
+            ).scalar()
+            
+            if not res_pp: # Insert hanya jika relasi belum ada
+                conn.execute(
+                    text("INSERT INTO principal_pipelines (project_name, principal_id, pipeline_id) VALUES (:pn, :prin_id, :pipe_id)"),
+                    {"pn": project_name, "prin_id": pid, "pipe_id": pipe_id}
+                )
+
+print("Berhasil! Seluruh data dari Excel telah di-import ke PostgreSQL tanpa duplikasi.")
